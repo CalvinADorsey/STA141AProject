@@ -1,0 +1,762 @@
+---
+title: "Course Project"
+author: "Calvin Dorsey"
+date: "2025-03-12"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(knitr)
+library(pROC)
+```
+
+# Abstract {-}
+In this study,  neural activity of mice was investigated during a series of decision-making tasks based their response to visual stimuli. Correct and incorrect choices were met with correspondingly positive or negative feedback based on the stimuli presented. Stimuli consisted of differing contrasts to the right and left of the mouse. Neuropixels probes were used to record approximately 30,000 neurons in 42 different brain regions across 18 different test sessions. Activation in individual brain areas proved to be inconsistent when presented with differing levels of stimuli presented along making the associated response hard to determine based solely on this. Instead, neural activity as a whole was used to determine their decision making along with difference in left and right visual contrast was examined to better determine the success rate of their decision. Both total neural activity and contrast difference proved to be effective in predicting positive feedback.
+
+# Introduction {-}
+This report, based on a study conducted by Steinmetz et al. (2019), was conducted to examine decision-making through the neural mechanisms and sensory information in order to find a predictive model for determining the positive and negative feedback associated with each decision. The data originally recorded in the study was done on 4 separate mice across 18 different sessions. Number of trials, number of neurons and number of brain areas being tested varied from session to session. Mice in each of these trials were presented with a visual stimuli consisting of two screens to the left and right. Each screen would display 1 of 4 contrast levels ranging from 0 to 1. After viewing the stimuli, the mouse would turn a wheel based on said stimulus. This decision would be met with either positive or negative feedback. Feedback was determined by the following criteria:
+
+- When left contrast > right contrast, success (1) if turning the wheel to the right and failure (-1) otherwise.  
+- When right contrast > left contrast, success (1) if turning the wheel to the left and failure (-1) otherwise.  
+- When both left and right contrasts are zero, success (1) if holding the wheel still and failure (-1) otherwise. 
+- When left and right contrasts are equal but non-zero, left or right will be randomly chosen (50%) as the correct choice. 
+
+The trials in all 18 sessions includes 5 common variables:
+
+- feedback_type: type of the feedback, 1 for success and -1 for failure
+- contrast_left: contrast of the left stimulus
+- contrast_right: contrast of the right stimulus
+- time: centers of the time bins for spks  
+- spks: numbers of spikes of neurons in the visual cortex in time bins defined in time
+- brain_area: area of the brain where each neuron lives
+
+In order to create and present an effective model for predicting this outcome, the report is divided into 5 different sections, exploratory data analysis, data integration, predictive modeling, predictive performance testing and discussion.
+
+```{r}
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('C:/Users/calvin/Desktop/STA141AProject/Data/session',i,'.rds',sep=''))
+}
+```
+
+# Exploratory Data Analysis {-}
+
+When looking at the data as a whole across all sessions, some important information we can extract include the name of the mouse in each trial, the date each session was conducted, the number of brain areas examined, the number of neurons examined and the success rate in each session.
+
+```{r}
+n.session = length(session)
+
+# creates empty tibble with placeholders
+meta = tibble(mouse_name = rep('name',n.session),
+  date_exp = rep('dt',n.session),
+  n_brain_area = rep(0,n.session),
+  n_neurons = rep(0,n.session),
+  n_trials = rep(0,n.session),
+  success_rate = rep(0,n.session))
+
+# fills table with corresponding extracted data
+for(i in 1:n.session){
+  curr = session[[i]];
+  meta[i,1] = curr$mouse_name;
+  meta[i,2] = curr$date_exp;
+  meta[i,3] = length(unique(curr$brain_area));
+  meta[i,4] = dim(curr$spks[[1]])[1];
+  meta[i,5] = length(curr$feedback_type);
+  meta[i,6] = length(which(curr$feedback_type>0))/length(curr$feedback_type)
+}
+
+kable(meta, format = "html", table.attr = "class='table table-striped'",digits=2)
+```
+
+This table is helpful in allowing us to understand the large amount of variability from session to session of variables including brain areas, number of neurons, number of trials and success rate. This would imply that looking into specific attributes of the data such as specific neurons or brain areas will be hard to use in order to find a predictive model for feedback outcome. General trends and patterns across data will have to be examined and utilized instead.
+To view how the mice have adapted to the testing from session to session we can use a plot of the changes of success rates for each mouse in each session.
+
+```{r}
+#filtering data from meta into each mouse
+cori = meta %>% filter(mouse_name == 'Cori')
+forssmann = meta %>% filter(mouse_name == 'Forssmann')
+hench = meta %>% filter(mouse_name == 'Hench')
+lederberg = meta %>% filter(mouse_name == 'Lederberg')
+mouse_names = list(cori, forssmann, hench, lederberg)
+
+#creates a plot of trends in success rate for each mouse
+for (i in mouse_names) {
+  plot = ggplot(i, aes(x = 1:nrow(i), y = success_rate)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth(method = 'lm', color = 'blue', linetype = 'dashed') +
+  labs(x = 'Sessions', y = 'Success Rate', title = i$mouse_name)
+}
+
+#creates a visualization containing all four plots side by side for later use
+combined_mice = bind_rows(cori, forssmann, hench, lederberg)
+
+grouped_plot = ggplot(combined_mice, aes(x = 1:nrow(combined_mice), y = success_rate)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth(method = 'lm', color = 'blue', linetype = 'dashed') +
+  labs(x = 'Sessions', y = 'Success Rate', title = 'Success Rate Across Sessions by Mouse') +
+  facet_wrap(~ mouse_name, scales = "free_x") +  
+  theme_minimal()
+
+grouped_plot
+```
+
+We can see from the success rate plots the extent to which experience in previous sessions impacts success rate positively for each mouse.
+
+Next we'd like to analyze feedback results and neural data in an individual session. We can first start by looking at the average neural spikes for each area of the brain in session 2 trial 1.
+
+```{r}
+# Values assigned for a single session and trial to be examined
+s = 2
+t = 1
+
+spk.trial = session[[s]]$spks[[t]]
+area=session[[s]]$brain_area
+spk.count=apply(spk.trial,1,sum)
+
+# function to calculate average spikes per brain area given a specific session and trial
+spk.avg = function(s, t){
+  spk.trial = session[[s]]$spks[[t]]
+  area = session[[s]]$brain_area
+
+  for(i in 1:dim(spk.trial)[1]){
+    spk.count[i]=sum(spk.trial[i,])
+  }
+
+  return(tapply(spk.count, area, mean))
+}
+
+#generates spike averages for the current session and trial
+spk.avg(s,t)
+```
+
+We can see from average spikes in the first trial that spikes across the 5 brain areas included are similar ranging from one to two spikes. 
+A useful way to use this data in other areas can be done through making a matrix for each individual trial consisting of average neural spikes for each brain area along with the corresponding feedback, left contrast and right contrast.
+
+```{r}
+# creates values for the number of brain areas and trials for the given session
+n.trial = length(session[[s]]$feedback_type)
+n.area = length(unique(session[[s]]$brain_area))
+
+# creates a matrix for the average spike counts for every trial in a session
+trial.summary = matrix(nrow=n.trial,ncol= n.area+1+2+1)
+for(t in 1:n.trial){
+  trial.summary[t,] = c(spk.avg(s, t), session[[s]]$feedback_type[t], session[[s]]$contrast_left[t], session[[s]]$contrast_right[t], t)
+}
+
+# assigns column names
+colnames(trial.summary) = c(names(spk.avg(s, t)), 'feedback', 'left_contr','right_contr','id' )
+
+# converts matrix to tibble for better viewing
+trial.summary = as_tibble(trial.summary)
+trial.summary
+```
+
+Looking at the provided table from the matrix can help us look at how differing spike averages correspond with different feedback outcomes and contrasts from trial to trial. To better analyze spike averages across the whole session we can use the newly provided matrix to create a line graph depicting brain activity across all trials in the session.
+
+```{r}
+# Organizes tibble columns in order to create plot
+trial_summary_long = trial.summary %>% select(!c(feedback, right_contr, left_contr)) %>%
+  pivot_longer(cols = -id, names_to = "Area", values_to = "Spike_Count")
+
+# number of brain areas
+n.area = length(unique(trial_summary_long$Area))
+
+# line graph for average neural spikes for each trial in a session
+ggplot(trial_summary_long, aes(x = id, y = Spike_Count, color = Area)) +
+  geom_line(aes(linetype = "Raw"), size = 0.5, alpha = 0.7) + 
+  geom_smooth(aes(linetype = "Smoothed"), method = "loess", se = FALSE, linewidth = 1.5) +
+  scale_color_manual(values = rainbow(n = n.area, alpha = 0.7)) +
+  scale_linetype_manual(values = c("Raw" = 2, "Smoothed" = 1)) + 
+  labs(title = paste("Spikes per area in Session", s), x = "Trials", y = "Average spike counts") +
+  theme_minimal() +
+  theme(legend.position = "top", legend.title = element_text(size = 12, face = "bold"))
+```
+
+This visualization can be used to better understand the trends in average neuron activation across all trials in session 2. Total neural activity can be seen gradually decreasing across the session while certain individual brain areas fluctuate more than others. Another possible important distinction that can be made is by splitting this plot into two separate plots. The first will correspond to the brain activity when the feedback outcome is negative and the second will correspond to the brain activity when the feedback outcome is positive.
+
+```{r}
+# filters trials by feedback outcome
+# negative feedback trials
+trial_summary_f = trial.summary %>% filter(feedback == -1) %>% select(!c(feedback, right_contr, left_contr)) %>% pivot_longer(cols = -id, names_to = "Area", values_to = "Spike_Count")
+# positive feedback trials
+trial_summary_t = trial.summary %>% filter(feedback == 1) %>% select(!c(feedback, right_contr, left_contr)) %>% pivot_longer(cols = -id, names_to = "Area", values_to = "Spike_Count")
+
+# line graph using only negative feedback trials
+ggplot(trial_summary_f, aes(x = id, y = Spike_Count, color = Area)) +
+  geom_line(aes(linetype = "Raw"), size = 0.5, alpha = 0.7) + 
+  geom_smooth(aes(linetype = "Smoothed"), method = "loess", se = FALSE, linewidth = 1.5) +
+  scale_color_manual(values = rainbow(n = n.area, alpha = 0.7)) +
+  scale_linetype_manual(values = c("Raw" = 2, "Smoothed" = 1)) + 
+  labs(title = paste("Spikes per area for negative feedback in Session", s), x = "Trials", y = "Average spike counts") +
+  theme_minimal() +
+  theme(legend.position = "top", legend.title = element_text(size = 12, face = "bold"), legend.text = element_text(size = 10))
+
+#line graph using only positive feedback trials
+ggplot(trial_summary_t, aes(x = id, y = Spike_Count, color = Area)) +
+  geom_line(aes(linetype = "Raw"), size = 0.5, alpha = 0.7) + 
+  geom_smooth(aes(linetype = "Smoothed"), method = "loess", se = FALSE, linewidth = 1.5) +
+  scale_color_manual(values = rainbow(n = n.area, alpha = 0.7)) +
+  scale_linetype_manual(values = c("Raw" = 2, "Smoothed" = 1)) + 
+  labs(title = paste("Spikes per area for positive feedback in Session", s), x = "Trials", y = "Average spike counts") +
+  theme_minimal() +
+  theme(legend.position = "top", legend.title = element_text(size = 12, face = "bold"), legend.text = element_text(size = 10))
+```
+
+When separating the average spike count for the session into negative and positive feedback, comparing the two shows that the negative feedback plot seems to accentuate the slight downward trend in the original line graph while the positive feedback plot seems to flatten out. The negative feedback line graph also shows a large spike at the start followed by much more fluctuation across all trials. While this could help indicate that negative feedback is associated with lower neural activity, many of these results could simply be a result of its relatively smaller sample size.
+
+```{r}
+# average spike count and standard deviation of spike counts for each brain area in a session
+brain_area_summary = trial_summary_long %>% group_by(Area) %>%
+  summarise(avg_spike_count = mean(Spike_Count), sd_spike_count = sd(Spike_Count))
+
+# values for negative feedback
+brain_area_summary_f = trial_summary_f %>% group_by(Area) %>%
+  summarise(avg_spike_count = mean(Spike_Count), sd_spike_count = sd(Spike_Count))
+
+# values for positive feedback
+brain_area_summary_t = trial_summary_t %>% group_by(Area) %>%
+  summarise(avg_spike_count = mean(Spike_Count), sd_spike_count = sd(Spike_Count))
+
+# merge all values together
+merged_summary <- brain_area_summary %>% full_join(brain_area_summary_f, by = "Area", suffix = c("", "_f")) %>% full_join(brain_area_summary_t, by = "Area", suffix = c("", "_t"))
+
+#display table containing all values
+kable(merged_summary, format = "html", table.attr = "class='table table-striped'", digits = 2)
+```
+
+Looking at the average and standard deviations for spike counts for the session and comparing them according to feedback outcome shows that negative feedback corresponded with a lower neural spike count on average. Standard deviations on the other hand proved to be relatively similar whether or not the feedback was positive.
+
+```{r}
+# function to create scatterplots for activated neurons vs time
+plot.trial = function(t,area, area.col,this_session){
+    spks = this_session$spks[[t]];
+    n.neuron = dim(spks)[1]
+    time.points = this_session$time[[t]]
+    plot(0,0,xlim = c(min(time.points),max(time.points)),ylim = c(0,n.neuron+1),col = 'white', xlab = 'Time (s)',yaxt = 'n', ylab = 'Neuron', main = paste('Trial ',t, 'feedback', this_session$feedback_type[t], '\ncontrast right', this_session$contrast_right[t], 'contrast left', this_session$contrast_left[t]),cex.lab = 1.5)
+    # loop through each neuron
+    for(i in 1:n.neuron){
+        i.a = which(area == this_session$brain_area[i]);
+        col.this = area.col[i.a]
+        ids.spike = which(spks[i,] >0) 
+        if( length(ids.spike) >0 ){
+            points(x = time.points[ids.spike],y = rep(i, length(ids.spike) ),pch = '.',cex = 2, col = col.this)
+        }
+    }
+legend("topright", 
+  legend = area, 
+  col = area.col, 
+  pch = 16, 
+  cex = 0.8)
+}
+
+varname = names(trial.summary);
+area = varname[1:(length(varname) -4)]
+area.col = rainbow(length(area))
+
+# creates side by side plots of the first two trials
+varname = names(trial.summary);
+area = varname[1:(length(varname) -4)]
+par(mfrow = c(1,2))
+plot.trial(1,area, area.col,session[[s]])
+plot.trial(2,area, area.col,session[[s]])
+# creates side by side plots of two other trials
+plot.trial(3,area, area.col,session[[s]])
+plot.trial(4,area, area.col,session[[s]])
+
+par(mfrow = c(1,1))
+```
+
+Looking at these scatterplots of neuron activation vs time gives a better insight into both the relationship between neural activation with feedback outcome and the relationship between contrast and neural activation. While these few scatterplots are a very limited sample for this comparison, they do highlight the importance that contrast has on neural activation, making contrast an imporant variable to investigate further, later on. For now, we'd like to look further into the difference in neural activity and how it relates to feedback outcome.
+
+```{r}
+avg_spikes_positive = list()
+avg_spikes_negative = list()
+
+# loop through each session
+for (s in 1:n.session) {
+  areas = unique(session[[s]]$brain_area)
+  avg_spikes_pos = numeric(length(areas))
+  avg_spikes_neg = numeric(length(areas))
+  names(avg_spikes_pos) = areas
+  names(avg_spikes_neg) = areas
+  # loop through each brain area in each session
+  for (area in areas) {
+    neuron_indices = which(session[[s]]$brain_area == area)
+    total_spikes_pos = 0
+    total_spikes_neg = 0
+    count_pos = 0
+    count_neg = 0
+    # loop through each trial in each brain area to find the amount of spikes depending on feedback
+    for (i in 1:length(session[[s]]$feedback_type)) {
+      if (session[[s]]$feedback_type[i] == 1) {
+        total_spikes_pos = total_spikes_pos + sum(session[[s]]$spks[[i]][neuron_indices, ])
+        count_pos = count_pos + 1
+      } else if (session[[s]]$feedback_type[i] == -1) {
+        total_spikes_neg = total_spikes_neg + sum(session[[s]]$spks[[i]][neuron_indices, ])
+        count_neg = count_neg + 1
+      }
+    }
+    # calculates average positive and negative feedback spikes for each brain area
+    avg_spikes_pos[area] = ifelse(count_pos > 0, total_spikes_pos / (length(neuron_indices) * count_pos), NA)
+    avg_spikes_neg[area] = ifelse(count_neg > 0, total_spikes_neg / (length(neuron_indices) * count_neg), NA)
+  }
+  # assigns average positive and negative feedback spikes for each session
+  avg_spikes_positive[[s]] = avg_spikes_pos
+  avg_spikes_negative[[s]] = avg_spikes_neg
+}
+
+# combines results into a data frame
+avg_spikes_combined = do.call(rbind, lapply(1:n.session, function(s) {
+  data.frame(Session = s,
+    BrainArea = names(avg_spikes_positive[[s]]),
+    AvgSpikes_Positive = avg_spikes_positive[[s]],
+    AvgSpikes_Negative = avg_spikes_negative[[s]])
+}))
+
+# gets all unique brain areas across all sessions
+brain_areas_all = unique(unlist(lapply(session, function(s) unique(s$brain_area))))
+
+# filters for brain areas that are present in at least one session
+avg_spikes_combined = avg_spikes_combined %>% filter(BrainArea %in% brain_areas_all)
+
+# summarizes across sessions
+avg_spikes_summary = avg_spikes_combined %>%
+  group_by(BrainArea) %>%
+  summarise(AvgSpikes_Positive = mean(AvgSpikes_Positive, na.rm = TRUE), AvgSpikes_Negative = mean(AvgSpikes_Negative, na.rm = TRUE)) %>%
+  # adds column for difference in average positive and negative feedback spikes
+  mutate(Difference = AvgSpikes_Positive - AvgSpikes_Negative)
+
+# displays the newly created table
+kable(avg_spikes_summary, format = "html", table.attr = "class='table table-striped'", digits = 2)
+```
+
+This table displays the difference between neural activity in all brain regions extending across all sessions. When looking at the data as a whole, the difference between neural activity associated with negative feedback vs positive feedback shows that almost every brain region contains higher neural activation when the feedback is positive. This gives greater confidence in the idea of higher neural spiking relating to increased rate of positive feedback on a larger scale which in turn makes it reasonable idea to use in the final prediction model.
+
+```{r}
+# bar plot showing differences in average neural spikes across all brain areas
+ggplot(avg_spikes_summary, aes(x = reorder(BrainArea, Difference), y = Difference, fill = Difference > 0)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  scale_fill_manual(values = c("TRUE" = "blue", "FALSE" = "red")) +
+  labs(title = "Difference in Average Spike Counts (Positive vs. Negative Feedback)", x = "Brain Area", y = "Difference (Positive - Negative)",fill = "Positive > Negative") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) 
+
+# calculates percent difference
+avg_spikes_summary = avg_spikes_summary %>%
+  mutate(Percent_Difference = ((AvgSpikes_Positive - AvgSpikes_Negative) / AvgSpikes_Negative) * 100)
+
+# bar plot for percent difference in average neural spikes per brain area
+ggplot(avg_spikes_summary, aes(x = reorder(BrainArea, Percent_Difference), y = Percent_Difference, fill = Percent_Difference > 0)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  scale_fill_manual(values = c("TRUE" = "blue", "FALSE" = "red")) +
+  labs(title = "Percent Difference in Average Spike Counts (Positive vs. Negative Feedback)", x = "Brain Area", y = "Percent Difference (%)", fill = "Positive > Negative") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# takes brain areas with above a 10% increase for positive feedback and brain areas below 5% decrease in positive feedback
+notable_percent_diff = avg_spikes_summary %>% filter(Percent_Difference > 10 | Percent_Difference < -5)
+```
+
+One possible area of interest when it comes to neural activity for this data is the relative increases and decreases in neural activity across brain areas. Since certain brain areas seem to have larger neuron counts, its possible that looking into percent increases could be a better metric for predicting feedbck outcome since it would allow other brain areas to have equal impact on the data despite having less neurons tested. The two bar plots shown above highlight the differences between brain areas that appear to have a larger positive association with feedback outcome depending solely on number of neuron spikes difference vs relative difference in number of spikes depending on the given brain region.
+
+```{r}
+avg_spikes_per_session = list()
+
+# loop through each session for average spikes
+for (s in 1:n.session) {
+  areas = unique(session[[s]]$brain_area)
+  avg_spikes = numeric(length(areas))
+  names(avg_spikes) = areas
+  # loop through each brain area for average spikes per brain area
+  for (area in areas) {
+    neuron_indices = which(session[[s]]$brain_area == area)
+    total_spikes = 0
+    # loops through each trial to sum total spikes
+    for (i in 1:length(session[[s]]$feedback_type)) {
+      total_spikes = total_spikes + sum(session[[s]]$spks[[i]][neuron_indices, ])
+    }
+    # calculates the average spikes for the current brain area
+    avg_spikes[area] = total_spikes / (length(neuron_indices) * length(session[[s]]$feedback_type))
+  }
+  avg_spikes_per_session[[s]] = avg_spikes
+}
+
+# converts the list to a data frame for plotting
+avg_spikes_df = do.call(rbind, lapply(1:n.session, function(s) {
+  data.frame(Session = s,
+    BrainArea = names(avg_spikes_per_session[[s]]),
+    AvgSpikes = avg_spikes_per_session[[s]],
+    MouseName = session[[s]]$mouse_name)
+}))
+
+# filters notable brain areas found prevbiously
+avg_spikes_df = avg_spikes_df %>% filter(BrainArea %in% notable_percent_diff$BrainArea)
+
+# plot the average spikes per brain area for each session, split by mouse
+ggplot(avg_spikes_df, aes(x = Session, y = AvgSpikes, color = BrainArea)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(title = "Average Spikes per Brain Area Across Sessions", x = "Session", y = "Average Spike Count", color = "Brain Area") 
+```
+
+Taking the most prominent brain areas found in the previous bar plot and viewing them on a session by session basis, it becomes clear that attempting to use specific brain areas for the predicitive model will prove difficult since none of the brain areas tested are shared across all trials along with many of them only appearing in a single trial. Because of this, looking into brain activation as a whole may prove to be a safer and more reliable way to predict feedback outcome going forward. 
+Now we'd like to shift focus from neural data to contrast data, more specifically on how the difference in contrast affects feedback outcome.
+
+
+```{r}
+# creates tibble for contrast and feedback data
+session_df = tibble(trial = 1:length(session[[s]]$contrast_left),  
+  contrast_left = session[[s]]$contrast_left,    
+  contrast_right = session[[s]]$contrast_right,  
+  feedback_type = session[[s]]$feedback_type,
+  contrast_diff = session[[s]]$contrast_right - session[[s]]$contrast_left) %>%
+  mutate(contrast_diff = contrast_left - contrast_right)
+
+# plots contrast difference across trials in a single session
+ggplot(session_df, aes(x = trial, y = contrast_diff, color = factor(feedback_type))) +
+  geom_point(size = 2, alpha = 0.7) +  
+  geom_line(alpha = 0.5) +             
+  labs(title = "Contrast Difference (Left - Right) Across Trials", x = "Trial Number", y = "Contrast Difference (Left - Right)", color = "Feedback Type") +
+  theme_minimal() +
+  scale_color_manual(values = c("-1" = "red", "1" = "blue"))  
+
+#plots only right contrast across trials in a single session
+ggplot(session_df, aes(x = trial, y = contrast_right, color = factor(feedback_type))) +
+  geom_point(size = 2, alpha = 0.7) +  
+  geom_line(alpha = 0.5) +             
+  labs(title = "Contrast Right Across Trials", x = "Trial Number", y = "Contrast Right", color = "Feedback Type") +
+  theme_minimal() +
+  scale_color_manual(values = c("-1" = "red", "1" = "blue"))  
+
+# plots only left contrast across trials
+ggplot(session_df, aes(x = trial, y = contrast_left, color = factor(feedback_type))) +
+  geom_point(size = 2, alpha = 0.7) +  
+  geom_line(alpha = 0.5) +             
+  labs(title = "Contrast Left Across Trials", x = "Trial Number", y = "Contrast Left", color = "Feedback Type") +
+  theme_minimal() +
+  scale_color_manual(values = c("-1" = "red", "1" = "blue"))  
+```
+
+Looking at the plots for contrast difference, it is clear that the vast majority negative feedback can be found when the difference in contrast is zero. This makes sense when thinking logically, since non-zero, equal left and right contrasts result in what is essentially a coin flip in feedback result. Another interesting feature of the plot which can be seen in the rapid increase in negative feedback towards the later trials despite larger contrasts difference. This may imply that session duration could also impact feedback outcome.
+
+```{r}
+# counts the number of positive and negative feedback outcomes for each contrast_diff level and calculate success rate
+feedback_counts = session_df %>%
+  group_by(contrast_diff) %>%
+  summarise(Count_Feedback_Negative = sum(feedback_type == -1),  
+    Count_Feedback_Positive = sum(feedback_type == 1),   
+    Total_Trials = n(),                                  
+    Success_Rate = Count_Feedback_Positive / Total_Trials)
+
+# displays the table containing success rates for every contrast difference
+kable(feedback_counts, format = "html", table.attr = "class='table table-striped'", digits = 2)
+
+# bar graph for success rate based on contrast difference
+ggplot(feedback_counts, aes(x = contrast_diff, y = Success_Rate, fill = Success_Rate)) +
+  geom_bar(stat = "identity", width = 0.2) +
+  scale_fill_gradient(low = "red", high = "green") + 
+  labs(title = "Success Rate by Contrast Difference (Left - Right) for single session", x = "Contrast Difference (Left - Right)", y = "Success Rate", fill = "Success Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The table of success rates correlating with contrast differences shows that there were many more trials with a contrast difference of zero which also happened to be the lowest success rate. The bar graph helps visualize the trend showing that success rate increases as contrast difference gets further from zero. Because there are so many trials with a contrast difference equal to zero, it would be useful to examine every combination of contrasts in order to view this data more in depth.
+
+```{r}
+# table for every combination of contrasts
+success_rate_table = session_df %>%
+  group_by(contrast_left, contrast_right) %>%
+  summarise(Total_Trials = n(), Success_Rate = sum(feedback_type == 1) / Total_Trials) %>%
+  ungroup()
+
+kable(success_rate_table, format = "html", table.attr = "class='table table-striped'", digits = 2)
+
+# plots a heatmap showing success rates for contrasts combinations
+ggplot(success_rate_table, aes(x = factor(contrast_left), y = factor(contrast_right), fill = Success_Rate)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "blue") +  
+  labs(title = "Success Rate by Left and Right Contrasts for single session", x = "Left Contrast", y = "Right Contrast", fill = "Success Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The table displaying the success rates of every combination of contrasts shows that a large majority of the contrast differences of zero come from trials where both both contrasts are both equal to zero as well. Using a heat map to better visualize the many combinations confirms larger contrast differences lead to a greater success rate. It also seems to show that success rates are greatly increased when one of the contrasts is equal to zero even if the difference in contrast is relatively low.
+
+```{r}
+all_sessions_df = list()
+
+# loops through each session and combines the data of all sessions
+for (s in 1:n.session) {
+  session_df = tibble(trial = 1:length(session[[s]]$contrast_left),  
+    contrast_left = session[[s]]$contrast_left,    
+    contrast_right = session[[s]]$contrast_right,  
+    feedback_type = session[[s]]$feedback_type,    
+    mouse_name = session[[s]]$mouse_name,           
+    contrast_diff = session[[s]]$contrast_right - session[[s]]$contrast_left)
+  all_sessions_df[[s]] = session_df
+}
+
+# combines data from all sessions into a single data frame
+all_sessions_combined = bind_rows(all_sessions_df)
+
+feedback_counts_all = all_sessions_combined %>%
+  group_by(contrast_diff) %>%
+  summarise(Count_Feedback_Negative = sum(feedback_type == -1), Count_Feedback_Positive = sum(feedback_type == 1), Total_Trials = n(), Success_Rate = Count_Feedback_Positive / Total_Trials)
+
+# table of success rates for contrast differences across all sessions
+kable(feedback_counts_all, format = "html", table.attr = "class='table table-striped'", digits = 2)
+
+# plots bar graph of success rates corresponding with contrast differences
+ggplot(feedback_counts_all, aes(x = contrast_diff, y = Success_Rate, fill = Success_Rate)) +
+  geom_bar(stat = "identity", width = 0.2) +
+  scale_fill_gradient(low = "red", high = "green") +
+  labs(title = "Success Rate by Contrast Difference (Left - Right) for all sessions", x = "Contrast Difference (Left - Right)", y = "Success Rate", fill = "Success Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Looking at the success rates for contrast differences across all sessions confirms that increases in contrast difference is positively correlated with success rate for the data as a whole.
+
+```{r}
+# calculates success rates for every combination of contrasts across all sessions
+success_rate_table_all_sessions <- all_sessions_combined %>%
+  group_by(contrast_left, contrast_right) %>%
+  summarise(Total_Trials = n(),  
+    Success_Rate = sum(feedback_type == 1) / Total_Trials) %>%
+  ungroup()
+
+# table for success rates for all combinations of contrasts across all sessions
+kable(success_rate_table_all_sessions, format = "html", table.attr = "class='table table-striped'", digits = 2)
+
+# plots a heatmap showing success rates for contrasts combinations across all sessions
+ggplot(success_rate_table_all_sessions, aes(x = factor(contrast_left), y = factor(contrast_right), fill = Success_Rate)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "blue") +  
+  labs(title = "Success Rate by Left and Right Contrasts for all sessions", x = "Left Contrast", y = "Right Contrast", fill = "Success Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The heat map for contrast combinations across all sessions also shows larger differences in contrast show higher success rate while success rates closer together have a much lower success rate especially when they are non-zero. This allows us to apply our assumptions from earlier to the data as a whole.
+
+# Data Integration {-}
+
+When integrating data based on our extensive exploratory analysis, an important place to start is by determining average neural spikes per trial across all sessions.
+
+```{r}
+# loops through sessions to add average spikes for each trial to our session data
+for (i in 1:n.session) {
+  n.trials = length(session[[i]]$feedback_type)
+  avg_spikes_all = numeric(n.trials)
+  # loops through each trial finding average neural spikes
+  for (j in 1:n.trials) {
+    spks.trial = session[[i]]$spks[[j]] 
+    total.spikes = apply(spks.trial, 1, sum)
+    avg_spikes_all[j] = mean(total.spikes)  
+  }
+  # Stores average neural spikes for every trial in a given session together
+  session[[i]]$avg_spks = avg_spikes_all
+}
+
+```
+
+Another area that was focused on extensively during analysis was the extent to which contrast corresponds with success rate. For this, we will integrate contrast difference into the model as well. Lastly, using data based on contrast combinations we can see that even when both contrasts are high, we may have conflicting outcomes with our two predictors previously mentioned. Because of this, combining these two variables together could prove to be significantly more useful then using each individually. This means that our combined variable measures whether both neural activity and contrast difference are high as a form of predicting feedback outcome.
+
+```{r}
+
+trials_all = tibble()
+
+# loops through all sessions to combine data
+for (i in 1:n.session) {
+  curr = session[[i]]
+  n.trials = length(curr$feedback_type)
+  
+  # creates a tibble of chosen variables for the current session
+  trials = tibble(
+    mouse_name = rep(curr$mouse_name, n.trials),
+    avg_spks = curr$avg_spks,
+    contrast_left = as.vector(curr$contrast_left),
+    contrast_right = as.vector(curr$contrast_right),
+    abs_contrast_diff = as.vector(abs(curr$contrast_right - curr$contrast_left)),
+    feedback_type = as.vector(curr$feedback_type),
+    session_ID = rep(i, n.trials),
+    combined = as.vector((curr$avg_spks * abs(curr$contrast_right - curr$contrast_left)))
+  )
+  
+  # combines all data across sessions together
+  trials_all = bind_rows(trials_all, trials)
+}
+str(trials_all)
+```
+
+
+# Predictive Modeling {-}
+
+Set up an 80% training data set that of randomly selected trials with the remaining 20% being the test data.
+
+```{r}
+set.seed(123)  
+# creates training and test data
+train_index = sample(1:nrow(trials_all), 0.8 * nrow(trials_all))
+train_data = trials_all[train_index, ]
+test_data = trials_all[-train_index, ]
+```
+
+The final predictors we will use in our model include average neural spikes per trial, contrast right, contrast left, session id, absolute contrast difference, and the combined metric of both average neural spikes and absolute contrast difference. We will use these variables to fit a logistic regression model using training data calculated previously
+
+```{r}
+# fits the logistic regression model using training data
+fit.mod = glm(
+  as.factor(feedback_type) ~ combined + abs_contrast_diff + avg_spks + contrast_right + contrast_left + as.factor(session_ID),
+  data = train_data,
+  family = 'binomial'
+)
+
+# summarizes the model
+summary(fit.mod)
+```
+
+Testing our newly created model using a confusion matrix and an ROC curve that our accuracy in predicting the feedback outcome from the test data set is approximately 72% and our area under the curve is 0.698.
+
+```{r}
+# generate predicted probabilities
+predicted_probs = predict(fit.mod, newdata = test_data, type = "response")
+
+# converts probabilities to binary predictions
+predicted_classes = ifelse(predicted_probs >= 0.5, 1, -1)
+
+# creates a confusion matrix
+confusion_matrix = table(Predicted = predicted_classes, Actual = test_data$feedback_type)
+confusion_matrix
+
+# calculates accuracy
+sum(diag(confusion_matrix)) / sum(confusion_matrix)
+
+# calculates ROC and area under the curve
+roc_curve = roc(response = test_data$feedback_type, predictor = predicted_probs)
+auc(roc_curve)
+
+# plots ROC curve
+plot(roc_curve, main = "ROC Curve", col = "blue", lwd = 2)
+```
+
+This means that the model is significantly better than simply guessing the feedback result in each trial. Overall, the model seems to do a decent job in predicting feedback outcome but still could have a lot of potential improvement.
+
+# Predictive Performance Testing {-}
+
+Now after being provided with test sessions for 100 randomly selected trials from session 1 and session 18, we can truly confirm its effectiveness. First we need to calculate the variables from our model and integrate them into the test sessions provided.
+
+```{r}
+# loads the test sets 
+test_session1 = readRDS("C:/Users/calvin/Desktop/STA141AProject/test/test1.rds")
+test_session18 = readRDS("C:/Users/calvin/Desktop/STA141AProject/test/test2.rds")
+
+# calculates variables from model created for test data in section 1
+n.trials = length(test_session1$feedback_type)
+avg_spikes_all = numeric(n.trials)
+
+for (j in 1:n.trials) {
+    spks.trial = test_session1$spks[[j]] 
+    total.spikes = apply(spks.trial, 1, sum)
+    avg_spikes_all[j] = mean(total.spikes)  
+}
+test_session1$avg_spks = avg_spikes_all
+
+test_data_1 = tibble(
+    mouse_name = rep(test_session1$mouse_name, n.trials),
+    avg_spks = test_session1$avg_spks,
+    contrast_left = test_session1$contrast_left,
+    contrast_right = test_session1$contrast_right,
+    abs_contrast_diff = abs(test_session1$contrast_right - test_session1$contrast_left),
+    feedback_type = test_session1$feedback_type,
+    session_ID = as.integer(rep(1, n.trials)),
+    combined = (test_session1$avg_spks * abs(test_session1$contrast_right - test_session1$contrast_left))
+  )
+
+# calculates variables from model created for test data in section 1
+n.trials = length(test_session18$feedback_type)
+avg_spikes_all = numeric(n.trials)
+
+for (j in 1:n.trials) {
+    spks.trial = test_session18$spks[[j]] 
+    total.spikes = apply(spks.trial, 1, sum)
+    avg_spikes_all[j] = mean(total.spikes)  
+}
+test_session18$avg_spks = avg_spikes_all
+
+test_data_18 = tibble(
+    mouse_name = rep(test_session18$mouse_name, n.trials),
+    avg_spks = test_session18$avg_spks,
+    contrast_left = test_session18$contrast_left,
+    contrast_right = test_session18$contrast_right,
+    abs_contrast_diff = abs(test_session18$contrast_right - test_session18$contrast_left),
+    feedback_type = test_session18$feedback_type,
+    session_ID = as.integer(rep(18, n.trials)),
+    combined = (test_session18$avg_spks * abs(test_session18$contrast_right - test_session18$contrast_left))
+  )
+```
+
+Now we will refit our logistic regression model on the entire original data set and use it as a training set for the two test sessions provided.
+
+```{r}
+# fits the logistic regression model using data from all trials
+fit.mod.performance = glm(
+  as.factor(feedback_type) ~ combined + abs_contrast_diff + avg_spks + contrast_right + contrast_left + as.factor(session_ID),
+  data = trials_all,
+  family = 'binomial'
+)
+
+# summarizes the model
+summary(fit.mod.performance)
+```
+
+The summary of our model shows that certain sessions are more important than others when it comes to predicting feedback outcome with the two most impactful variables we added being average spike counts and teh combination of average spikes and contrast difference. Lastly, we will use our model to attempt to predict the feedback outcome of the test sessions. We will also create a confusion matrix and ROC curves to determine the models overall accuracy
+
+```{r}
+# evaluates the model on the test sets
+test_session1_pred = predict(fit.mod.performance, newdata = test_data_1, type = "response")
+test_session18_pred = predict(fit.mod.performance, newdata = test_data_18, type = "response")
+
+# converts probabilities to binary predictions
+predicted_classes_1 = ifelse(test_session1_pred >= 0.5, 1, -1)
+predicted_classes_18 = ifelse(test_session18_pred >= 0.5, 1, -1)
+
+# creates a confusion matrices
+confusion_matrix_1 = table(Predicted = predicted_classes_1, Actual = test_data_1$feedback_type)
+confusion_matrix_1
+confusion_matrix_18 = table(Predicted = predicted_classes_18, Actual = test_data_18$feedback_type)
+confusion_matrix_18
+
+# calculates accuracies
+sum(diag(confusion_matrix_1)) / sum(confusion_matrix_1)
+sum(confusion_matrix_18[2]) / sum(confusion_matrix_18)
+
+# calculates performance metrics for each test set
+roc_session1 = roc(response = test_session1$feedback_type, predictor = test_session1_pred)
+roc_session18 = roc(response = test_session18$feedback_type, predictor = test_session18_pred)
+
+# plots roc curves of the two test sessions
+plot(roc_session1)
+plot(roc_session18)
+
+# calculates area under the curve for the two roc curves
+auc(roc_session1)
+auc(roc_session18)
+```
+
+Our final results for the test sessions show that the models accuracy in predicting feedback outcome was 74% accurate with an area under the curve of 0.8008 for test session 1 and 73% accurate with an area under the curve of 0.5771. Despite the similarity in accuracy, the large discrepancy in AUC between the two test sessions shows that the model is an inconsistent form of predicting feedback outcome from session to session.
+
+# Discussion {-}
+
+Using neural data in across many different brain areas along with visual stimuli, we attempted to predict feedback outcomes based on correct or incorrect decision-making. Our analysis of these features revealed many key insights into their relationship with this decision-making process. In our exploratory analysis, it was determined that higher neural activity across the vast majority brain areas was generally associated with an increased number in positive feedback outcomes. This was concluded when comparing average neural spike counts in trials with a positive feedback vs trials with a negative feedback. One major challenge and potential area of further interest was the specific role each brain area played in determining these outcomes. Because certain brain areas were used so inconsistently and number of neurons measured as a whole varied greatly from session to session, it proved extremely difficult to investigate each area individually across the whole data set. The other essential area of analysis presented was the difference in contrasts. We were able to determine that a greater difference between the left and right contrasts presented to each subject was correlated with a higher likelihood of correct decision-making being associated. A useful metric in our final model was the combined predictor of both average neural spikes and contrast difference that took both of these factors into account when predicting feedback outcome. Our final model performance proved to be somewhat effective on the data as a whole with an accuracy of 72% and an area under the curve of 0.7. However, when using the test sessions, the area under the curve showed a large inconsistency from test session 1 compared to test session 18. This showed that while the model was an effective predictor in session 1 it was not an effective predictor in session 18, revealing its potential inconsistency from session to session. In summary, using a combination of average neural spike counts and difference in contrasts proved to be somewhat effective in determining successful decision-making despite having some inconsistency across different sessions in the data. Looking into separating the individual roles of brain areas in further investigation could prove to be a more consistent and effective measure of feedback outcome through avoiding the reliance and oversimplification of using neural activity as a whole.
+
+# Reference {-}
+
+
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
